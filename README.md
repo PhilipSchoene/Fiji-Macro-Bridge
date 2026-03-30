@@ -18,17 +18,17 @@ The bridge operates using a tiered communication stack: Claude Desktop → Pytho
 Use Maven to package the Java component into a JAR file. The project targets Java 8 bytecode, ensuring compatibility with Fiji's bundled JVM.
 
 ```bash
-cd plugin
+cd path/to/Fiji-Macro-Bridge/plugin
 mvn package
 ```
 
-On success, the JAR is generated at `plugin/target/fiji-macro-bridge-1.0.0.jar`. The JAR contains shaded `org.json` and `plugins.config` as required by the specification.
+On success, the JAR is generated at `path/to/Fiji-Macro-Bridge/plugin/target/fiji-macro-bridge-1.0.0.jar`. The JAR contains shaded `org.json` and `plugins.config` as required by the specification.
 
 #### 2. Install the Plugin in Fiji
 Copy the generated JAR file into your Fiji `plugins` directory:
 
 ```bash
-cp plugin/target/fiji-macro-bridge-1.0.0.jar /path/to/Fiji.app/plugins/
+cp path/to/Fiji-Macro-Bridge/plugin/target/fiji-macro-bridge-1.0.0.jar /path/to/Fiji.app/plugins/
 ```
 
 #### 3. Setup Python Environment
