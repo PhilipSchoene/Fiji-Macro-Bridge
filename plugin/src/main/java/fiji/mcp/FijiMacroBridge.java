@@ -70,7 +70,7 @@ public class FijiMacroBridge implements PlugIn {
 
     private void startServer(int port) {
         try {
-            serverSocket = new ServerSocket(port);
+            serverSocket = new ServerSocket(port, 50, java.net.InetAddress.getLoopbackAddress());
             running = true;
             IJ.log("=== Fiji Macro Bridge ===");
             IJ.log("Started on port " + port);
