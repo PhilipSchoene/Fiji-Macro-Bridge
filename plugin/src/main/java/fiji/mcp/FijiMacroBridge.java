@@ -3,7 +3,10 @@ package fiji.mcp;
 import ij.IJ;
 import ij.ImagePlus;
 import ij.WindowManager;
+import ij.gui.ImageWindow;
+import ij.gui.Roi;
 import ij.macro.Interpreter;
+import ij.measure.Calibration;
 import ij.measure.ResultsTable;
 import ij.plugin.PlugIn;
 import org.json.JSONArray;
@@ -27,6 +30,7 @@ import java.awt.Label;
 import java.awt.TextComponent;
 import java.awt.Window;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -41,7 +45,6 @@ public class FijiMacroBridge implements PlugIn {
     private static final int DEFAULT_PORT = 5048;
     private static final int CLIENT_SOCKET_TIMEOUT_MS = 30000;
     private static final long COMMAND_TIMEOUT_MS = 600000L;
-
     private static volatile ServerSocket serverSocket;
     private static volatile boolean running = false;
     private static volatile Thread serverThread;
@@ -115,8 +118,15 @@ public class FijiMacroBridge implements PlugIn {
             clientSocket.setSoTimeout(CLIENT_SOCKET_TIMEOUT_MS);
             String line = in.readLine();
             if (line != null) {
-                JSONObject request = new JSONObject(line);
-                JSONObject response = processCommand(request);
+                JSONObject response;
+                try {
+                    JSONObject request = new JSONObject(line);
+                    response = processCommand(request);
+                } catch (Exception e) {
+                    response = new JSONObject();
+                    response.put("status", "error");
+                    response.put("error", "Failed to parse request: " + e.getMessage());
+                }
                 out.println(response.toString());
             }
         } catch (Exception e) {
@@ -163,6 +173,14 @@ public class FijiMacroBridge implements PlugIn {
                 return getResults();
             case "get_image_content":
                 return getImageContent();
+            case "list_open_images":
+                return listOpenImages();
+            case "select_image":
+                return selectImage(args);
+            case "get_log":
+                return getLog(args);
+            case "navigate_stack":
+                return navigateStack(args);
             default:
                 throw new IllegalArgumentException("Unknown command: " + command);
         }
@@ -202,13 +220,18 @@ public class FijiMacroBridge implements PlugIn {
         return imp;
     }
 
-    private String runMacro(JSONObject args) throws Exception {
+    private JSONObject runMacro(JSONObject args) throws Exception {
+        int logLinesBefore = countLogLines();
+        int[] idsBefore = WindowManager.getIDList();
+        int[] imageIdsBefore = idsBefore != null ? idsBefore : new int[0];
+
         MacroDialogMonitor monitor = new MacroDialogMonitor();
         monitor.start();
+        String macroResult;
         try {
             Interpreter interpreter = new Interpreter();
             interpreter.setIgnoreErrors(true);
-            String result = interpreter.run(args.getString("macro"), null);
+            macroResult = interpreter.run(args.getString("macro"), null);
             String dialogMessage = monitor.stopAndGetMessage();
 
             if (dialogMessage != null) {
@@ -217,16 +240,54 @@ public class FijiMacroBridge implements PlugIn {
             if (interpreter.wasError()) {
                 throw new Exception(formatInterpreterError(interpreter));
             }
-            if (result == null) {
-                return "";
-            }
-            if ("[aborted]".equals(result)) {
+            if ("[aborted]".equals(macroResult)) {
                 throw new Exception("Macro aborted");
             }
-            return result;
         } finally {
             monitor.stop();
         }
+
+        if (macroResult == null) {
+            macroResult = "";
+        }
+
+        int logLinesAfter = countLogLines();
+        int[] idsAfter = WindowManager.getIDList();
+        int[] imageIdsAfter = idsAfter != null ? idsAfter : new int[0];
+
+        JSONArray newImages = new JSONArray();
+        Set<Integer> beforeSet = new HashSet<Integer>();
+        for (int id : imageIdsBefore) beforeSet.add(id);
+        for (int id : imageIdsAfter) {
+            if (!beforeSet.contains(id)) {
+                ImagePlus newImp = WindowManager.getImage(id);
+                if (newImp != null) {
+                    JSONObject entry = new JSONObject();
+                    entry.put("id",    id);
+                    entry.put("title", newImp.getTitle());
+                    newImages.put(entry);
+                }
+            }
+        }
+
+        JSONObject enriched = new JSONObject();
+        enriched.put("result",             macroResult);
+        enriched.put("log_lines_added",    Math.max(0, logLinesAfter - logLinesBefore));
+        enriched.put("log_total_lines",    logLinesAfter);
+        enriched.put("new_images_opened",  newImages);
+        enriched.put("results_table_rows", getResultsTableRowCount());
+        return enriched;
+    }
+
+    private int countLogLines() {
+        String log = IJ.getLog();
+        if (log == null || log.isEmpty()) return 0;
+        return log.split("\n").length;
+    }
+
+    private int getResultsTableRowCount() {
+        ResultsTable rt = ResultsTable.getResultsTable();
+        return (rt != null) ? rt.size() : 0;
     }
 
     private String formatInterpreterError(Interpreter interpreter) {
@@ -274,8 +335,9 @@ public class FijiMacroBridge implements PlugIn {
         }
 
         String stopAndGetMessage() throws InterruptedException {
-            stop();
+            running.set(false);
             if (thread != null) {
+                thread.interrupt();
                 thread.join(500);
             }
             return message.get();
@@ -309,15 +371,7 @@ public class FijiMacroBridge implements PlugIn {
         }
 
         private boolean isBlockingDialog(Dialog dialog) {
-            if (!dialog.isModal()) {
-                return false;
-            }
-            String title = dialog.getTitle();
-            if (title == null) {
-                return true;
-            }
-            String normalizedTitle = title.trim();
-            return !normalizedTitle.isEmpty();
+            return dialog.isModal();
         }
 
         private String collectDialogText(Dialog dialog) {
@@ -447,18 +501,273 @@ public class FijiMacroBridge implements PlugIn {
         return table;
     }
 
-    private String getImageContent() throws Exception {
+    private JSONObject navigateStack(JSONObject args) throws Exception {
         ImagePlus imp = getActiveImage();
-        java.awt.image.BufferedImage image;
-        if (imp.getRoi() != null || imp.getOverlay() != null) {
-            image = imp.flatten().getBufferedImage();
-        } else {
-            image = imp.getBufferedImage();
+
+        int nChannels = imp.getNChannels();
+        int nSlices   = imp.getNSlices();
+        int nFrames   = imp.getNFrames();
+
+        int channel = args.has("channel") ? args.getInt("channel") : imp.getChannel();
+        int slice   = args.has("slice")   ? args.getInt("slice")   : imp.getSlice();
+        int frame   = args.has("frame")   ? args.getInt("frame")   : imp.getFrame();
+
+        if (channel < 1 || channel > nChannels) {
+            throw new Exception("channel " + channel + " out of range [1, " + nChannels + "]");
+        }
+        if (slice < 1 || slice > nSlices) {
+            throw new Exception("slice " + slice + " out of range [1, " + nSlices + "]");
+        }
+        if (frame < 1 || frame > nFrames) {
+            throw new Exception("frame " + frame + " out of range [1, " + nFrames + "]");
         }
 
+        imp.setPosition(channel, slice, frame);
+        imp.updateAndDraw();
+
+        JSONObject result = new JSONObject();
+        result.put("channel",     channel);
+        result.put("slice",       slice);
+        result.put("frame",       frame);
+        result.put("of_channels", nChannels);
+        result.put("of_slices",   nSlices);
+        result.put("of_frames",   nFrames);
+        return result;
+    }
+
+    private JSONObject getLog(JSONObject args) {
+        int sinceLine = Math.max(0, args.optInt("since_line", 0));
+
+        String log = IJ.getLog();
+        JSONObject result = new JSONObject();
+
+        if (log == null || log.isEmpty()) {
+            result.put("total_lines", 0);
+            result.put("since_line",  0);
+            result.put("lines",       new JSONArray());
+            return result;
+        }
+
+        String[] allLines = log.split("\n");
+        int totalLines = allLines.length;
+
+        JSONArray lines = new JSONArray();
+        for (int i = sinceLine; i < totalLines; i++) {
+            lines.put(allLines[i]);
+        }
+
+        result.put("total_lines", totalLines);
+        result.put("since_line",  sinceLine);
+        result.put("lines",       lines);
+        return result;
+    }
+
+    /** Builds the common per-image JSON used by list_open_images and select_image. */
+    private JSONObject buildImageEntry(int id, ImagePlus imp) {
+        JSONObject entry = new JSONObject();
+        entry.put("id",         id);
+        entry.put("title",      imp.getTitle());
+        entry.put("width",      imp.getWidth());
+        entry.put("height",     imp.getHeight());
+        entry.put("bit_depth",  imp.getBitDepth());
+        entry.put("type",       getImageTypeName(imp.getType()));
+        entry.put("channels",   imp.getNChannels());
+        entry.put("slices",     imp.getNSlices());
+        entry.put("frames",     imp.getNFrames());
+        entry.put("pixel_unit", imp.getCalibration().getUnit());
+        return entry;
+    }
+
+    private JSONArray listOpenImages() {
+        JSONArray list = new JSONArray();
+        int[] ids = WindowManager.getIDList();
+        if (ids == null) {
+            return list;
+        }
+        ImagePlus active = WindowManager.getCurrentImage();
+        for (int id : ids) {
+            ImagePlus imp = WindowManager.getImage(id);
+            if (imp == null) {
+                continue;
+            }
+            JSONObject entry = buildImageEntry(id, imp);
+            entry.put("is_active", active != null && imp == active);
+            list.put(entry);
+        }
+        return list;
+    }
+
+    private JSONObject selectImage(JSONObject args) throws Exception {
+        if (!args.has("id") && !args.has("title")) {
+            throw new IllegalArgumentException("Either 'id' or 'title' must be provided");
+        }
+
+        final ImagePlus imp;
+        final int id;
+
+        if (args.has("id")) {
+            id = args.getInt("id");
+            imp = WindowManager.getImage(id);
+            if (imp == null) {
+                throw new Exception("No image with ID " + id);
+            }
+        } else {
+            String title = args.getString("title");
+            int[] ids = WindowManager.getIDList();
+            ArrayList<Integer> matchIds = new ArrayList<Integer>();
+            ImagePlus matchImp = null;
+            if (ids != null) {
+                for (int candidate : ids) {
+                    ImagePlus candidateImp = WindowManager.getImage(candidate);
+                    if (candidateImp != null && title.equals(candidateImp.getTitle())) {
+                        matchIds.add(candidate);
+                        matchImp = candidateImp;
+                    }
+                }
+            }
+            if (matchIds.isEmpty()) {
+                throw new Exception("No image titled '" + title + "'");
+            }
+            if (matchIds.size() > 1) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < matchIds.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(matchIds.get(i));
+                }
+                throw new Exception("Multiple images titled '" + title + "': IDs " + sb);
+            }
+            id = matchIds.get(0);
+            imp = matchImp;
+        }
+
+        ImageWindow win = imp.getWindow();
+        if (win == null) {
+            throw new Exception("Image '" + imp.getTitle() + "' has no display window and cannot be selected.");
+        }
+        EventQueue.invokeAndWait(() -> win.toFront());
+
+        JSONObject result = buildImageEntry(id, imp);
+        result.put("selected", true);
+        return result;
+    }
+
+    private JSONObject getImageContent() throws Exception {
+        ImagePlus imp = getActiveImage();
+
+        // --- Core image properties ---
+        JSONObject metadata = new JSONObject();
+        metadata.put("title",           imp.getTitle());
+        metadata.put("width",           imp.getWidth());
+        metadata.put("height",          imp.getHeight());
+        metadata.put("bit_depth",       imp.getBitDepth());
+        metadata.put("type",            getImageTypeName(imp.getType()));
+        metadata.put("channels",        imp.getNChannels());
+        metadata.put("slices",          imp.getNSlices());
+        metadata.put("frames",          imp.getNFrames());
+        metadata.put("is_composite",    imp.isComposite());
+
+        // Current position in the stack — determines what the screenshot shows
+        metadata.put("current_channel", imp.getChannel());
+        metadata.put("current_slice",   imp.getSlice());
+        metadata.put("current_frame",   imp.getFrame());
+
+        // Display range — essential for interpreting 16-bit / 32-bit images
+        metadata.put("display_min",     imp.getDisplayRangeMin());
+        metadata.put("display_max",     imp.getDisplayRangeMax());
+
+        // --- Spatial and temporal calibration ---
+        Calibration cal = imp.getCalibration();
+        metadata.put("pixel_width",     cal.pixelWidth);
+        metadata.put("pixel_height",    cal.pixelHeight);
+        metadata.put("pixel_depth",     cal.pixelDepth);
+        metadata.put("pixel_unit",      cal.getUnit());
+        metadata.put("frame_interval",  cal.frameInterval);
+        metadata.put("time_unit",       cal.getTimeUnit());
+        metadata.put("value_unit",      cal.getValueUnit());
+        metadata.put("x_origin",        cal.xOrigin);
+        metadata.put("y_origin",        cal.yOrigin);
+        metadata.put("z_origin",        cal.zOrigin);
+
+        // --- ROI ---
+        Roi roi = imp.getRoi();
+        if (roi != null) {
+            JSONObject roiJson = new JSONObject();
+            roiJson.put("type",   roi.getTypeAsString());
+            java.awt.Rectangle rb = roi.getBounds();
+            roiJson.put("x",      rb.x);
+            roiJson.put("y",      rb.y);
+            roiJson.put("width",  rb.width);
+            roiJson.put("height", rb.height);
+            metadata.put("roi", roiJson);
+        }
+
+        // --- Overlay and embedded info ---
+        metadata.put("has_overlay", imp.getOverlay() != null);
+
+        String info = imp.getInfoProperty();
+        if (info != null && !info.trim().isEmpty()) {
+            // Truncate to keep token count reasonable while preserving key metadata lines
+            metadata.put("info_property",
+                info.length() > 1000 ? info.substring(0, 1000) + " ...[truncated]" : info);
+        }
+
+        // --- Screenshot: capture the ImageWindow exactly as the user sees it ---
+        // Preserves LUT, pseudocolor, overlays, scale bars and ROIs without
+        // any custom rendering logic, and produces standard RGB that the LLM handles well.
+        ImageWindow win = imp.getWindow();
+        if (win == null) {
+            throw new Exception(
+                "Image '" + imp.getTitle() + "' has no display window. " +
+                "Fiji must be running with a GUI for screenshot capture.");
+        }
+
+        // Capture on the EDT to avoid tearing during an active repaint
+        final AtomicReference<java.awt.image.BufferedImage> screenshotRef = new AtomicReference<>();
+        EventQueue.invokeAndWait(() -> {
+            java.awt.Rectangle bounds = win.getBounds();
+            try {
+                java.awt.Robot robot = new java.awt.Robot();
+                screenshotRef.set(robot.createScreenCapture(bounds));
+            } catch (java.awt.AWTException e) {
+                // Robot unavailable (rare: virtual framebuffer without Robot support)
+                // Fall back to component rendering
+                java.awt.image.BufferedImage fallback = new java.awt.image.BufferedImage(
+                        win.getWidth(), win.getHeight(),
+                        java.awt.image.BufferedImage.TYPE_INT_RGB);
+                java.awt.Graphics g = fallback.getGraphics();
+                try {
+                    win.paint(g);
+                } finally {
+                    g.dispose();
+                }
+                screenshotRef.set(fallback);
+            }
+        });
+
+        java.awt.image.BufferedImage screenshot = screenshotRef.get();
+        metadata.put("screenshot_width",  screenshot.getWidth());
+        metadata.put("screenshot_height", screenshot.getHeight());
+
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        javax.imageio.ImageIO.write(image, "png", baos);
-        return java.util.Base64.getEncoder().encodeToString(baos.toByteArray());
+        javax.imageio.ImageIO.write(screenshot, "png", baos);
+        String encoded = java.util.Base64.getEncoder().encodeToString(baos.toByteArray());
+
+        JSONObject result = new JSONObject();
+        result.put("image",    encoded);
+        result.put("metadata", metadata);
+        return result;
+    }
+
+    /** Maps the ImagePlus type constant to a human-readable string. */
+    private String getImageTypeName(int type) {
+        switch (type) {
+            case ImagePlus.GRAY8:     return "GRAY8";
+            case ImagePlus.GRAY16:    return "GRAY16";
+            case ImagePlus.GRAY32:    return "GRAY32";
+            case ImagePlus.COLOR_256: return "COLOR_256";
+            case ImagePlus.COLOR_RGB: return "COLOR_RGB";
+            default:                  return "UNKNOWN(" + type + ")";
+        }
     }
 }
 
