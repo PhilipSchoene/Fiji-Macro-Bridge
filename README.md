@@ -21,6 +21,7 @@ inside Fiji. One connection is opened per call; the Java side closes it after re
 - **Fiji**: Installed on your local machine.
 - **Java / Maven**: OpenJDK 11 or newer and Maven.
 - **Python 3.10+**: Standard installation.
+- **uv**: Fast Python package manager (see Installation below).
 - **Claude Desktop**: Installed and configured.
 
 ### Installation
@@ -41,13 +42,14 @@ The JAR is generated at `plugin/target/fiji-macro-bridge-1.0.0.jar` (shaded with
 cp plugin/target/fiji-macro-bridge-1.0.0.jar /path/to/Fiji.app/plugins/
 ```
 
-#### 3. Set up the Python environment
+#### 3. Install uv
 
 ```bash
-python3 -m venv fiji-macro-env
-source fiji-macro-env/bin/activate
-pip install mcp
+brew install uv
 ```
+
+No virtual environment setup or `pip install` is needed — `uv` manages dependencies
+automatically when launching the server.
 
 #### 4. Configure Claude Desktop
 
@@ -57,8 +59,12 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "fiji-macro": {
-      "command": "/path/to/fiji-macro-env/bin/python3",
-      "args": ["/path/to/fiji_mcp_macro.py"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "mcp",
+        "/path/to/fiji_mcp_macro.py"
+      ],
       "env": {
         "FIJI_PATH": "/path/to/Fiji.app/Contents/MacOS/fiji-macos",
         "FIJI_PORT": "5048"
@@ -67,6 +73,9 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
   }
 }
 ```
+
+> **Note:** If Claude Desktop cannot find `uv`, replace `"uv"` with its full path.
+> Run `which uv` in a terminal to get it (e.g. `/opt/homebrew/bin/uv`).
 
 Claude Desktop must be fully quit before this change takes effect — closing the window
 is not enough. Quit the application entirely via the menu bar, then relaunch it. Claude
