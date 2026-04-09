@@ -42,14 +42,15 @@ The JAR is generated at `plugin/target/fiji-macro-bridge-1.0.0.jar` (shaded with
 cp plugin/target/fiji-macro-bridge-1.0.0.jar /path/to/Fiji.app/plugins/
 ```
 
-#### 3. Install uv
+#### 3. Install dependencies
 
 ```bash
-brew install uv
+brew install maven uv
 ```
 
-No virtual environment setup or `pip install` is needed — `uv` manages dependencies
-automatically when launching the server.
+`maven` is required to build the Java plugin in step 1. `uv` manages the Python
+dependencies automatically when launching the server — no virtual environment setup
+or `pip install` needed.
 
 #### 4. Configure Claude Desktop
 
